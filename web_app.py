@@ -7,9 +7,10 @@ from datetime import datetime
 from streamlit_agraph import agraph, Node, Edge, Config
 
 
-# --- 1. 数据库逻辑 (持久化存储历史记录) ---
+# --- 1. 数据库逻辑 (统一路径，适配云端) ---
 def init_db():
-    conn = sqlite3.connect('../story_station_pro.db', check_same_thread=False)
+    # 删掉了 ../ 确保在云端也能正常创建数据库
+    conn = sqlite3.connect('story_station_pro.db', check_same_thread=False)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS analysis_history
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -20,10 +21,9 @@ def init_db():
     return conn
 
 
-# --- 2. 关系图渲染逻辑 ---
+# --- 2. 关系图渲染逻辑 (保持不变) ---
 def render_graph(raw_text):
     try:
-        # 从混合文本中提取最后的 JSON 块
         start = raw_text.find('{')
         end = raw_text.rfind('}') + 1
         if start == -1 or end == 0:
@@ -61,26 +61,22 @@ with st.sidebar:
         conn.commit()
         st.rerun()
 
-# --- 4. 主界面：文件处理与流式分析 ---
+# --- 4. 主界面：逻辑结构优化 ---
 st.title("🧠 深度故事分析工作站")
 st.markdown("支持多文件处理、流式实时输出及人物关系建模")
 
-# 尝试从 secrets 获取，如果不存在则设为 None
-try:
-    default_key = st.secrets["GEMINI_API_KEY"]
-except:
-    default_key = ""
+# --- 优化后的 API Key 处理逻辑 ---
+api_key = ""
+# 1. 优先尝试从 Secrets（云端/本地配置）读取
+if "GEMINI_API_KEY" in st.secrets and st.secrets["GEMINI_API_KEY"]:
+    api_key = st.secrets["GEMINI_API_KEY"]
+    st.sidebar.success("🔑 API Key 已安全加载")
+else:
+    # 2. 如果没配，才在主页显示输入框
+    api_key = st.text_input("Gemini API Key", type="password", help="请在后台配置以隐藏此框")
 
-col_api, col_file = st.columns([1, 2])
-with col_api:
-    # 如果 secrets 里有值，这里会自动填入
-    api_key = st.text_input(
-        "Gemini API Key",
-        value=default_key,
-        type="password",
-        help="已自动加载本地配置，如需更换请在此修改"
-    )
-    uploaded_files = st.file_uploader("上传 TXT 文件 (支持批量)", type="txt", accept_multiple_files=True)
+# --- 统一的文件上传区 (只写一次) ---
+uploaded_files = st.file_uploader("📂 上传 TXT 文件 (支持批量)", type="txt", accept_multiple_files=True)
 
 if uploaded_files and st.button("🚀 开始批量分析"):
     if not api_key:
@@ -90,71 +86,65 @@ if uploaded_files and st.button("🚀 开始批量分析"):
         model = genai.GenerativeModel('gemini-2.0-flash')
 
         for index, file in enumerate(uploaded_files):
-            # A. 文件大小限制 (1MB)
             if file.size > 1024 * 1024:
                 st.warning(f"跳过 {file.name}: 文件超过 1MB 限制。")
                 continue
 
             try:
+                # 确保每次循环都读取文件内容
                 content = file.read().decode("utf-8", errors="ignore")
 
-                # B. 构建 Prompt
                 prompt = f"""
                 作为文学分析专家，请阅读下文并输出：
                 1. 文章大意总结。
                 2. 故事主要情节。
                 3. 人物关系 JSON (必须严格放在回答最后)。
-
                 格式模板：
                 {{ "nodes": ["角色A"], "edges": [["角色A", "角色B", "关系"]] }}
-
                 内容：{content}
                 """
 
                 st.subheader(f"正在分析: {file.name}")
 
-                # C. 流式输出效果
-                # 使用 stream=True 开启流式传输
+                # 流式生成
                 response = model.generate_content(prompt, stream=True)
 
 
                 def stream_data():
-                    full_response = ""
+                    full_res = ""
                     for chunk in response:
-                        full_response += chunk.text
+                        full_res += chunk.text
                         yield chunk.text
-                    # 保存到数据库
+
+                    # 只有流结束后才写入数据库
                     now = datetime.now().strftime("%m-%d %H:%M")
-                    conn.execute("INSERT INTO analysis_history (filename, summary, time) VALUES (?, ?, ?)",
-                                 (file.name, full_response, now))
-                    conn.commit()
+                    # 使用当前线程的连接
+                    temp_conn = sqlite3.connect('story_station_pro.db')
+                    temp_conn.execute("INSERT INTO analysis_history (filename, summary, time) VALUES (?, ?, ?)",
+                                      (file.name, full_res, now))
+                    temp_conn.commit()
+                    temp_conn.close()
 
 
-                # 在界面上展示打字机效果
                 st.write_stream(stream_data)
-                st.success(f"{file.name} 分析并保存成功！")
-                # D. 频率限制保护 (多文件时)
+                st.success(f"{file.name} 分析完毕！")
+
                 if index < len(uploaded_files) - 1:
-                    st.info("等待 API 配额刷新 (10秒)...")
-                    time.sleep(10)
+                    time.sleep(5)  # 稍微缩短等待时间
 
             except Exception as e:
                 st.error(f"分析 {file.name} 时出错: {e}")
-# --- 5. 结果展示区 (查看历史或刚生成的记录) ---
+
+# --- 5. 结果展示区 ---
 if 'selected_id' in st.session_state:
     res = conn.execute("SELECT filename, summary FROM analysis_history WHERE id=?",
                        (st.session_state.selected_id,)).fetchone()
+
     if res:
         st.divider()
-        st.header(f"📑 报告详情：{res[0]}")
-
-        tab1, tab2 = st.tabs(["📖 阅读总结", "🕸️ 人物关系图谱"])
-
-        with tab1:
-            # 过滤掉 JSON，只显示文字
-            text_only = res[1].split('{')[0]
-            st.markdown(text_only)
-
-        with tab2:
-            st.info("💡 提示：你可以用鼠标拖动节点，或使用滚轮缩放图谱。")
-            render_graph(res[1])
+    st.header(f"📑 报告详情：{res[0]}")
+    tab1, tab2 = st.tabs(["📖 阅读总结", "🕸️ 人物关系图谱"])
+    with tab1:
+        st.markdown(res[1].split('{')[0])
+    with tab2:
+        render_graph(res[1])
