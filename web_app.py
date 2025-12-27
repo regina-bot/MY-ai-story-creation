@@ -83,7 +83,7 @@ if uploaded_files and st.button("🚀 开始批量分析"):
         st.error("请输入 API Key 后再继续。")
     else:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash')
 
         for index, file in enumerate(uploaded_files):
             if file.size > 1024 * 1024:
